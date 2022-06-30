@@ -14,8 +14,7 @@ class PatchLayer():
     def __init__(self,num_channels,patch_size) -> None:
         super().__init__()
         self.patch_size = patch_size
-        
-    def __call__(self,image):
+    def __call__(self,image,flatten_patches = True):
         '''
         Args:
         image:      input image (shape: [b,c,h,w])
@@ -26,7 +25,7 @@ class PatchLayer():
         '''
         # https://discuss.pytorch.org/t/creating-nonoverlapping-
         # patches-from-3d-data-and-reshape-them-back-to-the-image/51210/5
-        
+
         # (b, c, h', w, p_h*p_w)
         patches = image.unfold(2, self.patch_size, self.patch_size)
         # (b, c, h', w', p_h*p_w, p_h*p_w)
@@ -34,10 +33,25 @@ class PatchLayer():
         # (b, h', w', p_h*p_w, p_h*p_w, c)
         patches = patches.permute(0,2,3,4,5,1)
         # (b, h'*w', c*p_h*p_w)
-        return patches.flatten(3,4).flatten(3,4).flatten(1,2)
+        if flatten_patches:
+            return patches.flatten(3,4).flatten(3,4).flatten(1,2)
+        else: 
+            return patches.flatten(3,4).flatten(3,4)
 
+def sincos2d_positional_embedding(patches, temperature = 10000, dtype = torch.float32):
+    _, h, w, dim, device, dtype = *patches.shape, patches.device, patches.dtype
 
-class PositionalEmbedding(torch.nn.Module):
+    y, x = torch.meshgrid(torch.arange(h, device = device), torch.arange(w, device = device), indexing = 'ij')
+    assert (dim % 4) == 0, 'feature dimension must be multiple of 4 for sincos emb'
+    omega = torch.arange(dim // 4, device = device) / (dim // 4 - 1)
+    omega = 1. / (temperature ** omega)
+
+    y = y.flatten()[:, None] * omega[None, :]
+    x = x.flatten()[:, None] * omega[None, :] 
+    pe = torch.cat((x.sin(), x.cos(), y.sin(), y.cos()), dim = 1)
+    return pe.type(dtype)
+
+class LearnablePositionalEmbedding(torch.nn.Module):
     '''
     Adds a class token and a learnable positional encoding to the set of 
     patches, where the class token is encoded as the first token
@@ -99,6 +113,7 @@ class MultiHeadAttention(torch.nn.Module):
 
         self.dense = torch.nn.Linear(embedding_dim,embedding_dim)
         self.dropout = torch.nn.Dropout(dropout)
+        self.attention_weights = None
 
     def split_heads(self, x):
         """
@@ -173,7 +188,7 @@ class MultiHeadAttention(torch.nn.Module):
 
         # attention_logits (shape: [b, num_heads, len_q, depth_v])
         # attention_weights (shape: [b, num_heads, len_q, len_k])
-        attention_logits, attention_weights = self.scaled_dot_product_attention(
+        attention_logits, self.attention_weights = self.scaled_dot_product_attention(
             q, k, v)
 
          # [b, len_q, num_heads, depth_v]
@@ -185,7 +200,7 @@ class MultiHeadAttention(torch.nn.Module):
         # [b, len_q, embedding_dim]
         attention = self.dropout(self.dense(concat_attention)) 
 
-        return attention, attention_weights
+        return attention, self.attention_weights
 
 class EncoderLayer(torch.nn.Module):
     '''
@@ -267,14 +282,23 @@ class VisionTransformer(torch.nn.Module):
         num_layers,
         mlp_hidden, 
         num_classes,
+        learnable_embedding = True,
+        use_class_token = True,
         dropout = 0.1
     ):
         super().__init__()
-
+        self.learnable_embedding = learnable_embedding
+        self.use_class_token = use_class_token
         self.patch_layer = PatchLayer(num_channels,patch_size)
         self.feature_embedding = torch.nn.Linear(num_channels*(patch_size**2), embedding_dim)
 
-        self.positional_embedding = PositionalEmbedding(embedding_dim,num_patches)
+        if learnable_embedding:
+            # self.positional_embedding = torch.nn.Parameter(
+            #     torch.randn(1,1+num_patches,embedding_dim)
+            # )
+            # self.class_token = torch.nn.Parameter(torch.randn(1,1,embedding_dim))
+            self.positional_embedding = LearnablePositionalEmbedding(embedding_dim,num_patches)
+
         self.transformer = torch.nn.Sequential(
             *[EncoderLayer(
                 embedding_dim, num_heads, mlp_hidden, dropout=dropout
@@ -290,16 +314,27 @@ class VisionTransformer(torch.nn.Module):
     def forward(self,x):
         '''
         Args:
-        x:              input image (shape: [c,h,w])
+        x:              input image (shape: [b,c,h,w])
 
         Returns:
         out:            classification logits (shape: [1,num_classes])
         '''
-        x = self.patch_layer(x)
-        x = self.feature_embedding(x)
-        x = self.positional_embedding(x)
+        if self.learnable_embedding:
+            x = self.patch_layer(x)
+            x = self.feature_embedding(x)
+            #class_token = self.class_token.repeat(x.shape[0],1,1)
+            #x = torch.cat([class_token,x],dim=1)
+            #x = x + self.positional_embedding
+            x = self.positional_embedding(x)
+        else:
+            x = self.patch_layer(x,flatten_patches=False)
+            x = self.feature_embedding(x)
+            x = x.flatten(1,2) + sincos2d_positional_embedding(x)
         x = self.transformer(x)
-        cls = x[:,0]
+        if self.use_class_token:
+            cls = x[:,0]
+        else:
+            cls = x.mean(dim = 1)
         out = self.mlp_head(cls)
         return out
 
@@ -311,7 +346,7 @@ if __name__ == '__main__':
     b,c,h,w = 4, 3, 32, 32
     x = torch.randn(b, c, h, w)
 
-    patch_size = 4
+    patch_size = 2
     num_patches = (h//patch_size)*(w//patch_size)
 
     out = VisionTransformer(
@@ -323,6 +358,8 @@ if __name__ == '__main__':
         num_layers = 7, 
         mlp_hidden= 384, 
         num_classes=10, 
+        learnable_embedding=False,
+        use_class_token = False,
         dropout=0.1
     )(x) 
     print(out)

@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import numpy as np
 from data_augmentations import CutMix,MixUp
+import warmup_scheduler
 
 class Trainer():
     def __init__(self,
@@ -10,14 +11,14 @@ class Trainer():
         train_loader, 
         val_loader,
         epochs,
+        warmup_epoch,
         max_lr,
         min_lr,
-        grad_clip = 0.1 ,
-        weight_decay = 1e-4, 
+        weight_decay = 5e-5, 
         checkpoint_path = '.',
         checkpoint_interval = 100,
         print_interval = 100,
-        label_smoothing = 0.0,
+        label_smoothing = 0.1,
         use_cutmix = False,
         use_mixup = False,
         im_size = None
@@ -35,13 +36,19 @@ class Trainer():
         self.max_lr = max_lr
         self.checkpoint_path = checkpoint_path
         self.checkpoint_interval = checkpoint_interval
-        self.grad_clip = grad_clip
         self.weight_decay = weight_decay
-        self.optimizer = torch.optim.AdamW(
-            model.parameters(), max_lr #, weight_decay=weight_decay
+        # self.optimizer = torch.optim.AdamW(
+        #     model.parameters(), max_lr #, weight_decay=weight_decay
+        # )
+        self.optimizer = torch.optim.Adam(
+            model.parameters(), lr = max_lr, betas=(0.9, 0.999), weight_decay=weight_decay
         )
-        self.scheduler =  torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=epochs, eta_min=min_lr)
+        #self.scheduler =  torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=epochs, eta_min=min_lr)
+        self.base_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=epochs, eta_min=min_lr)
+        self.scheduler = warmup_scheduler.GradualWarmupScheduler(self.optimizer, multiplier=1., total_epoch=warmup_epoch, after_scheduler=self.base_scheduler)
         self.criterion  = torch.nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+        self.use_cutmix = use_cutmix
+        self.use_mixup = use_mixup
         if use_cutmix:
             self.cutmix = CutMix(im_size, beta=1.)
         if use_mixup:
@@ -89,10 +96,10 @@ class Trainer():
             
             preds = self.model(images)
 
-            if self.cutmix or self.mixup:
-                if self.cutmix:
+            if self.use_cutmix or self.use_mixup:
+                if self.use_cutmix:
                     images, labels, rand_labels, lambda_= self.cutmix((images, labels))
-                elif self.mixup:
+                elif self.use_mixup:
                     if np.random.rand() <= 0.8:
                         images, labels, rand_labels, lambda_ = self.mixup((images, labels))
                     else:
